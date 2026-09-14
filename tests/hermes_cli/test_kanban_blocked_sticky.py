@@ -31,11 +31,13 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
+from hermes_cli import kanban_db_dispatch as kbd
 
 
 @pytest.fixture
@@ -76,6 +78,44 @@ def test_worker_block_is_not_auto_promoted_by_recompute_ready(kanban_home: Path)
             assert promoted == 0, "worker-blocked task must not auto-promote"
             assert kb.get_task(conn, tid).status == "blocked"
 
+
+
+
+def test_initial_capability_block_survives_link_reconciliation_and_dispatch(
+    kanban_home: Path, all_assignees_spawnable, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pre-dispatch human block never becomes a dispatcher candidate.
+
+    This reproduces the live regression: a remediation card created directly
+    in ``blocked`` status was linked as a dependency parent, then the next
+    lifecycle reconciliation promoted and spawned it because it had no
+    explicit ``blocked`` event yet.
+    """
+    spawn = Mock(return_value=4242)
+    conn = kbc.connect()
+    try:
+        parent = kb.create_task(
+            conn, title="requires operator capability", initial_status="blocked",
+        )
+        child = kb.create_task(conn, title="consumer waiting for repair")
+
+        kb.link_tasks(conn, parent, child)
+        result = kbd.dispatch_once(conn, spawn_fn=spawn)
+
+        blocked = kb.get_task(conn, parent)
+        waiting = kb.get_task(conn, child)
+        events = kb.list_events(conn, parent)
+        assert result.spawned == []
+        spawn.assert_not_called()
+        assert blocked is not None
+        assert blocked.status == "blocked"
+        assert blocked.current_run_id is None
+        assert blocked.worker_pid is None
+        assert kb.latest_run(conn, parent) is None
+        assert waiting is not None and waiting.status == "todo"
+        assert any(event.kind == "created" for event in events)
+    finally:
+        conn.close()
 
 
 
