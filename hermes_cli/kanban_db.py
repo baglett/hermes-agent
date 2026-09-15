@@ -71,6 +71,8 @@ new locking.
 from __future__ import annotations
 
 import contextlib
+import importlib
+import inspect
 import hashlib
 import json
 import os
@@ -93,6 +95,62 @@ from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missi
 from toolsets import get_toolset_names
 
 _log = logging.getLogger(__name__)
+
+
+class SpawnAdmissionError(RuntimeError):
+    """A configured autonomous-worker admission gate rejected a spawn."""
+
+
+class SpawnAdmissionDeferred(RuntimeError):
+    """A healthy admission gate deferred a spawn without treating it as failure.
+
+    Distinct from :class:`SpawnAdmissionError`: this is for denials that
+    reflect a condition OUTSIDE the task's own control (provider outage,
+    quota reserve threshold, governor paused/draining, no global capacity)
+    — the task itself is fine and must not have its bounded
+    ``consecutive_failures`` retry budget consumed, nor be auto-blocked.
+    The dispatcher returns the task to its source lane with a ``deferred``
+    run outcome instead (see ``_record_spawn_deferred``).
+    """
+
+
+def _load_configured_spawn_guard():
+    """Return the optional configured guard, rejecting broken configuration."""
+    from hermes_cli.config import load_config
+    spec = (load_config().get("kanban", {}).get("spawn_guard") or "").strip()
+    if not spec:
+        return None
+    module_name, separator, attribute = spec.partition(":")
+    if not separator or not module_name or not attribute:
+        raise SpawnAdmissionError("kanban.spawn_guard must be module:callable")
+    try:
+        guard = getattr(importlib.import_module(module_name), attribute)
+    except Exception as exc:
+        raise SpawnAdmissionError("configured Kanban spawn guard unavailable") from exc
+    if not callable(guard):
+        raise SpawnAdmissionError("configured Kanban spawn guard is not callable")
+    return guard
+
+
+def _spawn_with_guard(task, workspace: str, board: str | None, native_spawn):
+    """Invoke the configured admission gate before every dispatcher spawn."""
+    def call_native(current_task, current_workspace, *, board=None):
+        try:
+            if "board" in inspect.signature(native_spawn).parameters:
+                return native_spawn(current_task, current_workspace, board=board)
+        except (TypeError, ValueError):
+            pass
+        return native_spawn(current_task, current_workspace)
+
+    guard = _load_configured_spawn_guard()
+    if guard is None:
+        return call_native(task, workspace, board=board)
+    try:
+        return guard(task, workspace, board, call_native)
+    except (SpawnAdmissionError, SpawnAdmissionDeferred):
+        raise
+    except Exception as exc:
+        raise SpawnAdmissionError(str(exc)) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -1589,10 +1647,21 @@ def _sqlite_connect(path: Path) -> sqlite3.Connection:
         isolation_level=None,
         timeout=busy_timeout_ms / 1000.0,
     )
-    # ``sqlite3.connect(timeout=...)`` normally maps to busy_timeout, but set
-    # the PRAGMA explicitly so it is observable and survives future wrapper
-    # changes. Parameter binding is not supported for PRAGMA assignments.
-    conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
+    try:
+        # ``sqlite3.connect(timeout=...)`` normally maps to busy_timeout, but set
+        # the PRAGMA explicitly so it is observable and survives future wrapper
+        # changes. Parameter binding is not supported for PRAGMA assignments.
+        conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
+    except BaseException:
+        # A half-open connection abandoned here would leak its fd AND leave a
+        # stale entry in the connect_tracked live-connection registry (which
+        # only clears on close), permanently blocking byte-level probes of
+        # this database file. Close before re-raising.
+        try:
+            conn.close()
+        except Exception:
+            pass
+        raise
     return conn
 
 
@@ -9343,6 +9412,54 @@ def _record_spawn_failure(
     )
 
 
+def _record_spawn_deferred(
+    conn: sqlite3.Connection,
+    task_id: str,
+    reason: str,
+) -> None:
+    """Return a policy-deferred spawn to its source lane without failure debt.
+
+    Counterpart to :func:`_record_spawn_failure` for a
+    :class:`SpawnAdmissionDeferred` raised by the configured spawn guard.
+    Unlike a genuine spawn failure, the task's ``consecutive_failures``
+    breaker is left untouched — a provider outage, quota reserve
+    threshold, or momentary capacity ceiling is not the task's fault, and
+    charging it against the bounded retry budget would eventually
+    auto-block a perfectly healthy task purely because its provider or the
+    governor were busy/unavailable at spawn time. Mirrors the existing
+    ``rate_limited`` exit path in :func:`detect_crashed_workers`, which
+    applies the same "not a task failure" treatment for a mid-run quota
+    wall.
+    """
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, current_run_id FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if row is None:
+            return
+        retry_status = _retry_status_for_run(conn, task_id, row["current_run_id"])
+        conn.execute(
+            "UPDATE tasks SET status = ?, claim_lock = NULL, claim_expires = NULL, "
+            "worker_pid = NULL WHERE id = ? AND status = 'running'",
+            (retry_status, task_id),
+        )
+        run_id = _end_run(
+            conn,
+            task_id,
+            outcome="deferred",
+            status="deferred",
+            error=reason[:500],
+            metadata={"reason": reason[:500], "retry_status": retry_status},
+        )
+        _append_event(
+            conn,
+            task_id,
+            "spawn_deferred",
+            {"reason": reason[:500], "retry_status": retry_status},
+            run_id=run_id,
+        )
+
+
 def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
     """Record the spawned child's pid + emit a ``spawned`` event.
 
@@ -10251,18 +10368,7 @@ def _dispatch_once_locked(
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
-            # Back-compat: older spawn_fn signatures accept only
-            # (task, workspace). Test stubs in the suite rely on that.
-            # Introspect the callable and pass `board` only when supported.
-            import inspect
-            try:
-                sig = inspect.signature(_spawn)
-                if "board" in sig.parameters:
-                    pid = _spawn(claimed, str(workspace), board=board)
-                else:
-                    pid = _spawn(claimed, str(workspace))
-            except (TypeError, ValueError):
-                pid = _spawn(claimed, str(workspace))
+            pid = _spawn_with_guard(claimed, str(workspace), board, _spawn)
             if pid:
                 _set_worker_pid(conn, claimed.id, int(pid))
             # Worker-lifecycle observer (RFC #58548): fires AFTER spawn_fn
@@ -10288,6 +10394,8 @@ def _dispatch_once_locked(
                 _per_profile_running[claimed.assignee] = (
                     _per_profile_running.get(claimed.assignee, 0) + 1
                 )
+        except SpawnAdmissionDeferred as exc:
+            _record_spawn_deferred(conn, claimed.id, str(exc))
         except Exception as exc:
             auto = _record_spawn_failure(
                 conn, claimed.id, str(exc),
@@ -11674,8 +11782,8 @@ def purge_stale_done_notify_subs(
     *,
     max_age_days: int = 30,
 ) -> int:
-    """Delete notify subscriptions whose task has sat in ``done`` untouched
-    for longer than ``max_age_days``.
+    """Delete notify subscriptions whose task has sat in ``done`` or
+    ``blocked`` untouched for longer than ``max_age_days``.
 
     The notifier keeps subscriptions alive through ``done`` because a
     completed task can be reopened (review corrections, continuation) and
@@ -11684,7 +11792,10 @@ def purge_stale_done_notify_subs(
     subscription rows forever — each one scanned every notifier tick.
     This GC bounds that: a task that has been ``done`` with no new events
     for the retention window is treated as settled and its subscriptions
-    are purged. Age is measured from the task's most recent event
+    are purged. ``blocked`` tasks (circuit-breaker trips, dead workers)
+    are reaped on the same clock — they are abandoned, not idle, unlike a
+    ``backlog``/``ready`` card that is merely waiting for pickup (#100955).
+    Age is measured from the task's most recent event
     (falling back to ``completed_at`` then ``created_at``), so ANY
     activity — including a reopen, which also moves the task off
     ``done`` — resets or exempts it.
@@ -11703,7 +11814,7 @@ def purge_stale_done_notify_subs(
         cur = conn.execute(
             "DELETE FROM kanban_notify_subs WHERE task_id IN ("
             " SELECT t.id FROM tasks t"
-            " WHERE t.status = 'done'"
+            " WHERE t.status IN ('done', 'blocked')"
             " AND COALESCE("
             "  (SELECT MAX(e.created_at) FROM task_events e"
             "   WHERE e.task_id = t.id),"
