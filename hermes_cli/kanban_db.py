@@ -1350,7 +1350,35 @@ def create_task(
                         "provider_override": provider_override,
                     },
                 )
+                if task_status == "blocked":
+                    # A task parked directly in ``blocked`` at creation
+                    # (``initial_status="blocked"`` — human-ops capability /
+                    # needs-input parking) must be just as sticky as an
+                    # explicit worker/operator ``kanban_block`` call.
+                    # ``_has_sticky_block`` only inspects the most recent
+                    # ``blocked``/``unblocked`` event; a ``created`` event
+                    # alone is invisible to it, so without this the very
+                    # next ``recompute_ready`` (e.g. triggered when this
+                    # task is linked as a dependency parent) sees a
+                    # ``blocked`` task with no parents of its own, treats
+                    # "parents satisfied" as trivially true, and silently
+                    # promotes + eventually dispatches it — a genuine
+                    # human-ops block that was never touched by
+                    # ``kanban_unblock``. Recorded actor/reason keep this
+                    # transition auditable exactly like a worker block.
+                    _append_event(
+                        conn,
+                        task_id,
+                        "blocked",
+                        {
+                            "reason": body or "created directly in blocked status",
+                            "kind": None,
+                            "actor": created_by,
+                            "source_status": "ready",
+                        },
+                    )
                 # ACK-edge: the originating channel hears a child BLOCK, not just the fan-in.
+
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
             return task_id
         except sqlite3.IntegrityError:
